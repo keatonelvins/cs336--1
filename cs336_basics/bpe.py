@@ -2,8 +2,6 @@ import os
 import re
 from collections import Counter
 
-from torch import T
-
 from .pretokenization_example import find_chunk_boundaries
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"""
@@ -36,8 +34,9 @@ def train(
                 Merges are ordered by order of creation.
     """
     num_processes = os.cpu_count() or 1
-
     num_merges = vocab_size - len(special_tokens) - 256 # 256 for the initial UTF-8 bytes
+    vocab = {i: token.encode("utf-8") for i, token in enumerate(special_tokens)}
+    merges = []
     
     with open(input_path, "rb") as f:
         # First, we chunk the file such that each chunk starts with a special token.
@@ -47,29 +46,44 @@ def train(
 
         # Create token -> count maps for each chunk
         # TODO: Parallelize this
-        counters = []
+        chunk_counters = []
         for start, end in zip(boundaries[:-1], boundaries[1:]):
             # start, end are byte indices delimiting the chunk
             f.seek(start)
             chunk = f.read(end - start).decode("utf-8", errors="ignore") # decode bytes back to string
 
-            # Before pre-tokenization, we need to split on special tokens so these are not split into multiple tokens.
-            # Don't need to use capturing groups as these special tokens shouldn't be factored into the train anyway
-            sub_chunks = re.split("|".join(re.escape(token) for token in special_tokens), chunk) # regex looks like |<token1>|<token2>|...
+            # Before pre-tokenization, we need to split on special tokens so these are not split/merged later
+            sub_chunks = re.split("|".join(re.escape(token) for token in special_tokens), chunk) # regex looks like |<\|token1\|>|<\|token2\|>|...
             
-            # Run train
             for sub_chunk in sub_chunks:  # TODO: parallelize this
-                # Get mapping of tokens to counts, where each 'token' is represented by a tuple of bytes
+                # Get mapping of byte tuples formed by PAT split to counts (e.g. {(b"h", b"i"): 1, ...})
                 token_iter = re.finditer(PAT, sub_chunk)
                 bytes_iter = map(lambda t: tuple(t.group().encode("utf-8")), token_iter)
-                counters.append(Counter(bytes_iter)) # dict[tuple[bytes], int]
+                chunk_counters.append(Counter(bytes_iter)) # Counter(bytes_iter) -> dict[tuple[bytes], count]
 
-        # Merge all the counters
-        global_counter = dict(sum(counters, Counter())) # Merge counters and cast back to dict[tuple[bytes], int]
-        splitter = lambda c: [((c[0][:i], c[0][i:]), c[1]) for i in range(1, len(c[0]))]
-        global_pair_counts = map(splitter, global_counter.items())
-        count_index = Counter(sum(global_pair_counts, [])) # index of byte pair to count w/ pre-tokenization
-        
-        # Begin merging tokens
-        for _ in range(num_merges):
-            most_common = count_index.most_common(1)[0]
+    # Get ready to train!!
+    global_counter = dict(sum(chunk_counters, Counter())) # Merge all counters for global dict[tuple[bytes], count]
+
+    # Some utility functions
+    count_pairs = lambda t: [Counter({(t[0][:i] + t[0][i:]): t[1]}) for i in range(1, len(t[0]))] # tuple[bytes] -> shingle counts i.e. dict[(byte1, byte2), count]
+    def merge_bytes(t, m): # tuple[bytes] -> tuple[bytes] where (a, b, c) -> (a, bc) if m = bc
+        result = []
+        i = 0
+        while i < len(t):
+            if i < len(t) - 1 and t[i] + t[i+1] == m:
+                result.append(m)
+                i += 2
+            else:
+                result.append(t[i])
+                i += 1
+        return tuple(result)
+
+    # Begin merging tokens
+    for _ in range(num_merges):
+        global_pair_counts = map(count_pairs, global_counter.items())
+        count_index = Counter(sum(global_pair_counts, Counter())) # index of byte pair to count w/ pre-tokenization
+        new_merge = count_index.most_common(1)[0] # get most common two-byte pair
+        merges.append(new_merge)
+        global_counter = {merge_bytes(t, new_merge): c for t, c in global_counter.items()}
+
+    return vocab, merges
