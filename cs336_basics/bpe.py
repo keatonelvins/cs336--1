@@ -3,7 +3,6 @@ uv run pytest tests/test_train_bpe.py
 """
 
 import os
-from token import tok_name
 import regex
 from collections import Counter
 from multiprocessing import Pool
@@ -25,11 +24,20 @@ def count_pre_tokens(chunk, r_split):
     pre_token_counts = Counter()
     
     for sub_chunk in sub_chunks:
-        # Count occurences of pre-tokens formed by PAT split (e.g. {(12, 34, 56): 1, ...})
+        # Count occurences of pre-tokens formed by PAT split
         token_iter = regex.finditer(PAT, sub_chunk)
-        bytes_iter = map(lambda t: tuple(t.group().encode("utf-8")), token_iter)
+        bytes_iter = map(lambda t: tuple(bytes([byte]) for byte in t.group().encode("utf-8")), token_iter)
         pre_token_counts.update(bytes_iter) # Counter(bytes_iter) -> dict[tuple[bytes], count]
     return pre_token_counts
+
+def flatten_pre_token_counts(pre_tok_counts) -> Counter:
+    toks, n = pre_tok_counts
+    return sum([Counter({(toks[i], toks[i+1]): n}) for i in range(len(toks)-1)], Counter())
+
+# Counter is probably a bad abstraction for this problem. Don't need most_common, more like all_tying_highest
+def get_merge(pair_counts: Counter) -> tuple:    
+    max_count = pair_counts.most_common(1)[0][1]
+    return max(pair for pair, count in pair_counts.items() if count == max_count)
 
 def train(
     input_path: str | os.PathLike,
@@ -59,8 +67,7 @@ def train(
                 Merges are ordered by order of creation.
     """
     num_processes = os.cpu_count() or 1
-    num_merges = vocab_size - len(special_tokens) - 256 # 256 for the initial UTF-8 bytes
-    vocab = {i: bytes(i) for i in range(256)}
+    vocab = {i: bytes([i]) for i in range(256)}
     vocab = vocab | {i + 256: token.encode("utf-8") for i, token in enumerate(special_tokens)}
     merges = []
     r_split = "|".join(regex.escape(token) for token in special_tokens) # regex looks like |<\|token1\|>|<\|token2\|>|...
@@ -71,51 +78,43 @@ def train(
         boundaries = find_chunk_boundaries(
             f, num_processes, "<|endoftext|>".encode("utf-8"))
         
-        # In parallel, read all the chunks of text from the file
-        with Pool(processes=num_processes) as pool:
-            chunks = pool.map(partial(read_chunk, input_path), list(zip(boundaries[:-1], boundaries[1:])))
+    # In parallel, read all the chunks of text from the file
+    with Pool(processes=num_processes) as pool:
+        chunks = pool.map(partial(read_chunk, input_path), list(zip(boundaries, boundaries[1:])))
 
-        # Then get all the pre-token counts
-        with Pool(processes=num_processes) as pool:
-            token_counts = sum(pool.map(partial(count_pre_tokens, r_split=r_split), chunks), Counter())
+    # Then get all the pre-token counts
+    with Pool(processes=num_processes) as pool:
+        pre_token_counts = sum(pool.map(partial(count_pre_tokens, r_split=r_split), chunks), Counter())
 
-        # Flatten pre-token counts into byte-pair counts
-        def flatten(c: Counter):
-            result = Counter()
-            for toks, n in c.items():
-                result += sum([Counter({(toks[i], toks[i+1]): n}) for i in range(len(toks) - 1)], Counter())
-            return result
+    # And all the paired counts too
+    with Pool(processes=num_processes) as pool:
+        pair_counts = sum(pool.map(flatten_pre_token_counts, pre_token_counts.items()), Counter())
 
-        # Take pre-token counts and merge the most common byte pair
-        def merge_bytes(counts: Counter, merge: tuple[bytes, bytes]):
-            out = Counter()
-            for toks, n in counts.items():
-                if len(toks) == 1:
-                    out[toks] = n
-                    continue
+    # Time to start merging!
+    for j in range(len(special_tokens) + 256, vocab_size):
+        merge = get_merge(pair_counts) # helper func to break lexicographic ties
+        del pair_counts[merge]
+        merges.append(merge)
+        merged_token = merge[0] + merge[1]
+        vocab[j] = merged_token
 
-                new_toks = ()
-                i = 0
-                while i < len(toks) - 1:
-                    if toks[i] == merge[0] and toks[i+1] == merge[1]:
-                        new_toks += (merge[0] + merge[1],)
-                        i += 2
-                    else:
-                        new_toks += (toks[i],)
-                        i += 1
-                if i == len(toks) - 1:
-                    new_toks += (toks[i],)
-                out[new_toks] = n
-            return out
+        # I think this part could be parallelized too?
+        new_counts = Counter()
+        for toks, n in pre_token_counts.items():
+            i = 0
+            while i < len(toks) - 1:
+                if toks[i] == merge[0] and toks[i+1] == merge[1]:
+                    if i > 0:
+                        pair_counts[(toks[i-1], toks[i])] -= n
+                        pair_counts[(toks[i-1], merged_token)] += n
+                    if i < len(toks) - 2:
+                        pair_counts[(toks[i+1], toks[i+2])] -= n
+                        pair_counts[(merged_token, toks[i+2])] += n
+                    toks = toks[:i] + (merged_token,) + toks[i+2:]
+                else:
+                    i += 1
+            
+            new_counts[toks] = n
+        pre_token_counts = new_counts
 
-        for _ in range(num_merges):
-            pair_counts = flatten(token_counts)
-            new_merge, _ = pair_counts.most_common(1)[0]
-            merges.append(new_merge)
-            token_counts = merge_bytes(token_counts, new_merge)
-
-        final_tokens = set(sum(list(token_counts), ())) # python voodoo to flatten list of tuples
-        offset = 256 + len(special_tokens)
-        vocab = vocab | {i: token for i, token in enumerate(final_tokens, start=offset)}
-
-        return vocab, merges
+    return vocab, merges
