@@ -16,10 +16,13 @@ class Tokenizer:
         self.special_tokens = set(special_tokens) if special_tokens else set()
 
         # Regex pattern to split on special tokens
-        self.r_split = "|".join(f"({regex.escape(token)})" for token in self.special_tokens)
+        self.r_split = "|".join(f"({regex.escape(token)})" for token in sorted(self.special_tokens, key=len, reverse=True))
+        existing_tokens = set(self.vocab.values())
         for token in self.special_tokens:
-            if token not in self.vocab:
-                self.vocab[len(self.vocab)-1] = token.encode("utf-8") # add special tokens to vocab
+            bytes_token = token.encode("utf-8")
+            if bytes_token not in existing_tokens:
+                self.vocab[len(self.vocab)] = bytes_token # add special tokens to vocab
+                existing_tokens.add(bytes_token)
 
         self.bacov = {v: k for k, v in self.vocab.items()} # lol
 
@@ -40,13 +43,15 @@ class Tokenizer:
 
         pre_tokens = [] # List[tuple[bytes]]
         for chunk in chunks:
+            if not chunk:
+                continue
             if chunk in self.special_tokens:
                 pre_tokens.append((chunk.encode("utf-8"),))
                 continue
             pre_token_iter = regex.finditer(self.PAT, chunk)
             bytes_iter = map(lambda t: tuple(bytes([byte]) for byte in t.group().encode("utf-8")), pre_token_iter)
             pre_tokens.extend(bytes_iter)
-
+            
         merged_tokens = []
         for pre_token in pre_tokens:
             merged_token = self._merge(pre_token)
@@ -56,7 +61,9 @@ class Tokenizer:
         return encoded_ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
-        pass
+        for text in iterable:
+            tokens = self.encode(text)
+            yield from tokens
 
     def decode(self, ids: list[int]) -> str:
         byte_chunks = b''.join([self.vocab[i] for i in ids])
