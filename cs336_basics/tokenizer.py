@@ -1,5 +1,5 @@
 """
-uv run pytest tests/test_tokenizer.py
+uv run pytest -k test_tokenizer.py
 """
 
 import json
